@@ -1455,6 +1455,9 @@ class WanVideoSampler:
                 "force_offload": ("BOOLEAN", {"default": True, "tooltip": "Moves the model to the offload device after sampling"}),
                 "scheduler": (scheduler_list, {"default": "uni_pc",}),
                 "riflex_freq_index": ("INT", {"default": 0, "min": 0, "max": 1000, "step": 1, "tooltip": "Frequency index for RIFLEX, disabled when 0, default 6. Allows for new frames to be generated after without looping"}),
+                # Customized for framepack
+                "total_second_length": ("FLOAT", {"default": 5.0, "min": 1.0, "max": 120.0, "step": 0.1}),
+                "latent_window_size": ("INT", {"default": 8, "min": 1, "max": 50, "step": 1}),
             },
             "optional": {
                 "text_embeds": ("WANVIDEOTEXTEMBEDS", ),
@@ -1489,7 +1492,8 @@ class WanVideoSampler:
     def process(self, model, image_embeds, shift, steps, cfg, seed, scheduler, riflex_freq_index, text_embeds=None,
         force_offload=True, samples=None, feta_args=None, denoise_strength=1.0, context_options=None, 
         cache_args=None, teacache_args=None, flowedit_args=None, batched_cfg=False, slg_args=None, rope_function="default", loop_args=None, 
-        experimental_args=None, sigmas=None, unianimate_poses=None, fantasytalking_embeds=None, uni3c_embeds=None, multitalk_embeds=None, freeinit_args=None, start_step=0, end_step=-1, add_noise_to_samples=False):
+        experimental_args=None, sigmas=None, unianimate_poses=None, fantasytalking_embeds=None, uni3c_embeds=None, multitalk_embeds=None, 
+        freeinit_args=None, start_step=0, end_step=-1, add_noise_to_samples=False, total_second_length=5.0, latent_window_size=8):
         
         patcher = model
         model = model.model
