@@ -1488,7 +1488,301 @@ class WanVideoSampler:
     RETURN_NAMES = ("samples", "denoised_samples",)
     FUNCTION = "process"
     CATEGORY = "WanVideoWrapper"
-
+    #Region model pred for a single section
+    def _predict_with_cfg(self, z, cfg_scale, positive_embeds, negative_embeds, timestep, idx, **kwargs):
+        
+        nonlocal transformer
+        z_pos = kwargs.get('z_pos', z)
+        z_neg = kwargs.get('z_neg', z)
+        z = z.to(dtype)
+        with torch.autocast(device_type=mm.get_autocast_device(device), dtype=dtype, enabled=("fp8" in model["quantization"])):
+            if use_cfg_zero_star and (idx <= zero_star_steps) and use_zero_init:
+                return z*0, None
+            nonlocal patcher
+            current_step_percentage = idx / len(timesteps)
+            control_lora_enabled = False
+            image_cond_input = None
+            if control_latents is not None:
+                if control_lora:
+                    control_lora_enabled = True
+                else:
+                    if (control_start_percent <= current_step_percentage <= control_end_percent) or \
+                        (control_end_percent > 0 and idx == 0 and current_step_percentage >= control_start_percent):
+                        image_cond_input = torch.cat([control_latents.to(z), image_cond.to(z)])
+                    else:
+                        image_cond_input = torch.cat([torch.zeros_like(control_latents, dtype=dtype), image_cond.to(z)])
+                    if fun_ref_image is not None:
+                        fun_ref_input = fun_ref_image.to(z)
+                    else:
+                        fun_ref_input = torch.zeros_like(z, dtype=z.dtype)[:, 0].unsqueeze(1)
+                        #fun_ref_input = None
+                if control_lora:
+                    if not control_start_percent <= current_step_percentage <= control_end_percent:
+                        control_lora_enabled = False
+                        if patcher.model.is_patched:
+                            log.info("Unloading LoRA...")
+                            patcher.unpatch_model(device)
+                            patcher.model.is_patched = False
+                    else:
+                        image_cond_input = control_latents.to(z)
+                        if not patcher.model.is_patched:
+                            log.info("Loading LoRA...")
+                            patcher = apply_lora(patcher, device, device, low_mem_load=False, control_lora=True)
+                            patcher.model.is_patched = True
+                            
+            elif ATI_tracks is not None and ((ati_start_percent <= current_step_percentage <= ati_end_percent) or 
+                          (ati_end_percent > 0 and idx == 0 and current_step_percentage >= ati_start_percent)):
+                image_cond_input = image_cond_ati.to(z)
+            else:
+                image_cond_input = image_cond.to(z) if image_cond is not None else None
+            if control_camera_latents is not None:
+                if (control_camera_start_percent <= current_step_percentage <= control_camera_end_percent) or \
+                        (control_end_percent > 0 and idx == 0 and current_step_percentage >= control_camera_start_percent):
+                    control_camera_input = control_camera_latents.to(z)
+                else:
+                    control_camera_input = None
+            if recammaster is not None:
+                z = torch.cat([z, recam_latents.to(z)], dim=1)
+                
+            use_phantom = False
+            if phantom_latents is not None:
+                if (phantom_start_percent <= current_step_percentage <= phantom_end_percent) or \
+                    (phantom_end_percent > 0 and idx == 0 and current_step_percentage >= phantom_start_percent):
+                    z_pos = torch.cat([z[:,:-phantom_latents.shape[1]], phantom_latents.to(z)], dim=1)
+                    z_phantom_img = torch.cat([z[:,:-phantom_latents.shape[1]], phantom_latents.to(z)], dim=1)
+                    z_neg = torch.cat([z[:,:-phantom_latents.shape[1]], torch.zeros_like(phantom_latents).to(z)], dim=1)
+                    use_phantom = True
+                    if cache_state is not None and len(cache_state) != 3:
+                        cache_state.append(None)
+            if not use_phantom:
+                z_pos = z_neg = z
+            if controlnet_latents is not None:
+                if (controlnet_start <= current_step_percentage < controlnet_end):
+                    self.controlnet.to(device)
+                    controlnet_states = self.controlnet(
+                        hidden_states=z.unsqueeze(0).to(device, self.controlnet.dtype),
+                        timestep=timestep,
+                        encoder_hidden_states=positive_embeds[0].unsqueeze(0).to(device, self.controlnet.dtype),
+                        attention_kwargs=None,
+                        controlnet_states=controlnet_latents.to(device, self.controlnet.dtype),
+                        return_dict=False,
+                    )[0]
+                    if isinstance(controlnet_states, (tuple, list)):
+                        controlnet["controlnet_states"] = [x.to(z) for x in controlnet_states]
+                    else:
+                        controlnet["controlnet_states"] = controlnet_states.to(z)
+            add_cond_input = None
+            if add_cond is not None:
+                if (add_cond_start_percent <= current_step_percentage <= add_cond_end_percent) or \
+                    (add_cond_end_percent > 0 and idx == 0 and current_step_percentage >= add_cond_start_percent):
+                    add_cond_input = add_cond
+            if minimax_latents is not None:
+                if context_window is not None:
+                    z_pos = z_neg = torch.cat([z, minimax_latents[:, context_window], minimax_mask_latents[:, context_window]], dim=0)
+                else:
+                    z_pos = z_neg = torch.cat([z, minimax_latents, minimax_mask_latents], dim=0)
+            
+            if not multitalk_sampling and multitalk_audio_embedding is not None:
+                audio_embedding = multitalk_audio_embedding
+                audio_embs = []
+                indices = (torch.arange(4 + 1) - 2) * 1
+                human_num = len(audio_embedding)
+                # split audio with window size
+                if context_window is None:
+                    for human_idx in range(human_num):   
+                        center_indices = torch.arange(
+                            0,
+                            latent_video_length * 4 + 1 if add_cond is not None else (latent_video_length-1) * 4 + 1,
+                            1).unsqueeze(1) + indices.unsqueeze(0)
+                        center_indices = torch.clamp(center_indices, min=0, max=audio_embedding[human_idx].shape[0] - 1)
+                        audio_emb = audio_embedding[human_idx][center_indices].unsqueeze(0).to(device)
+                        audio_embs.append(audio_emb)
+                else:
+                    for human_idx in range(human_num):
+                        audio_start = context_window[0] * 4
+                        audio_end = context_window[-1] * 4 + 1
+                        #print("audio_start: ", audio_start, "audio_end: ", audio_end)
+                        center_indices = torch.arange(audio_start, audio_end, 1).unsqueeze(1) + indices.unsqueeze(0)
+                        center_indices = torch.clamp(center_indices, min=0, max=audio_embedding[human_idx].shape[0] - 1)
+                        audio_emb = audio_embedding[human_idx][center_indices].unsqueeze(0).to(device)
+                        audio_embs.append(audio_emb)
+                multitalk_audio_input = torch.concat(audio_embs, dim=0).to(dtype)
+                
+            elif multitalk_sampling and multitalk_audio_embeds is not None:
+                multitalk_audio_input = multitalk_audio_embeds
+            
+            if context_window is not None and pcd_data is not None and pcd_data["render_latent"].shape[2] != context_frames:
+                pcd_data_input = {"render_latent": pcd_data["render_latent"][:, :, context_window]}
+                for k in pcd_data:
+                    if k != "render_latent":
+                        pcd_data_input[k] = pcd_data[k]
+            else:
+                pcd_data_input = pcd_data
+             
+            base_params = {
+                'seq_len': seq_len,
+                'device': device,
+                'freqs': freqs,
+                't': timestep,
+                'current_step': idx,
+                'last_step': len(timesteps) - 1 == idx,
+                'control_lora_enabled': control_lora_enabled,
+                'enhance_enabled': enhance_enabled,
+                'camera_embed': camera_embed,
+                'unianim_data': unianim_data,
+                'fun_ref': fun_ref_input if fun_ref_image is not None else None,
+                'fun_camera': control_camera_input if control_camera_latents is not None else None,
+                'audio_proj': audio_proj if fantasytalking_embeds is not None else None,
+                'audio_scale': audio_scale,
+                "pcd_data": pcd_data_input,
+                "controlnet": controlnet,
+                "add_cond": add_cond_input,
+                "nag_params": text_embeds.get("nag_params", {}),
+                "nag_context": text_embeds.get("nag_prompt_embeds", None),
+                "multitalk_audio": multitalk_audio_input if multitalk_audio_embedding is not None else None,
+                "ref_target_masks": ref_target_masks if multitalk_audio_embedding is not None else None,
+                "inner_t": [shot_len] if shot_len else None,
+            }
+            batch_size = 1
+            if not math.isclose(cfg_scale, 1.0):
+                if negative_embeds is None:
+                    raise ValueError("Negative embeddings must be provided for CFG scale > 1.0")
+                if len(positive_embeds) > 1:
+                    negative_embeds = negative_embeds * len(positive_embeds)
+            try:
+                if not batched_cfg:
+                    #cond
+                    noise_pred_cond, cache_state_cond = transformer(
+                        [z_pos], context=positive_embeds, y=[image_cond_input] if image_cond_input is not None else None,
+                        clip_fea=clip_fea, is_uncond=False, current_step_percentage=current_step_percentage,
+                        pred_id=cache_state[0] if cache_state else None,
+                        vace_data=vace_data, attn_cond=attn_cond,
+                        **base_params
+                    )
+                    noise_pred_cond = noise_pred_cond[0].to(intermediate_device)
+                    if math.isclose(cfg_scale, 1.0):
+                        if use_fresca:
+                            noise_pred_cond = fourier_filter(
+                                noise_pred_cond,
+                                scale_low=fresca_scale_low,
+                                scale_high=fresca_scale_high,
+                                freq_cutoff=fresca_freq_cutoff,
+                            )
+                        return noise_pred_cond, [cache_state_cond]
+                    #uncond
+                    if fantasytalking_embeds is not None:
+                        if not math.isclose(audio_cfg_scale[idx], 1.0):
+                            base_params['audio_proj'] = None
+                    noise_pred_uncond, cache_state_uncond = transformer(
+                        [z_neg], context=negative_embeds, clip_fea=clip_fea_neg if clip_fea_neg is not None else clip_fea,
+                        y=[image_cond_input] if image_cond_input is not None else None, 
+                        is_uncond=True, current_step_percentage=current_step_percentage,
+                        pred_id=cache_state[1] if cache_state else None,
+                        vace_data=vace_data, attn_cond=attn_cond_neg,
+                        **base_params
+                    )
+                    noise_pred_uncond = noise_pred_uncond[0].to(intermediate_device)
+                    #phantom
+                    if use_phantom and not math.isclose(phantom_cfg_scale[idx], 1.0):
+                        noise_pred_phantom, cache_state_phantom = transformer(
+                        [z_phantom_img], context=negative_embeds, clip_fea=clip_fea_neg if clip_fea_neg is not None else clip_fea,
+                        y=[image_cond_input] if image_cond_input is not None else None, 
+                        is_uncond=True, current_step_percentage=current_step_percentage,
+                        pred_id=cache_state[2] if cache_state else None,
+                        vace_data=None,
+                        **base_params
+                    )
+                        noise_pred_phantom = noise_pred_phantom[0].to(intermediate_device)
+                        
+                        noise_pred = noise_pred_uncond + phantom_cfg_scale[idx] * (noise_pred_phantom - noise_pred_uncond) + cfg_scale * (noise_pred_cond - noise_pred_phantom)
+                        return noise_pred, [cache_state_cond, cache_state_uncond, cache_state_phantom]
+                    #fantasytalking
+                    if fantasytalking_embeds is not None:
+                        if not math.isclose(audio_cfg_scale[idx], 1.0):
+                            if cache_state is not None and len(cache_state) != 3:
+                                cache_state.append(None)
+                            base_params['audio_proj'] = None
+                            noise_pred_no_audio, cache_state_audio = transformer(
+                                [z_pos], context=positive_embeds, y=[image_cond_input] if image_cond_input is not None else None,
+                                clip_fea=clip_fea, is_uncond=False, current_step_percentage=current_step_percentage,
+                                pred_id=cache_state[2] if cache_state else None,
+                                vace_data=vace_data,
+                                **base_params
+                            )
+                            noise_pred_no_audio = noise_pred_no_audio[0].to(intermediate_device)
+                            noise_pred = (
+                                noise_pred_uncond
+                                + cfg_scale * (noise_pred_no_audio - noise_pred_uncond)
+                                + audio_cfg_scale[idx] * (noise_pred_cond - noise_pred_no_audio)
+                                )
+                            return noise_pred, [cache_state_cond, cache_state_uncond, cache_state_audio]
+                    elif multitalk_audio_embedding is not None:
+                        if not math.isclose(audio_cfg_scale[idx], 1.0):
+                            if cache_state is not None and len(cache_state) != 3:
+                                cache_state.append(None)
+                            base_params['multitalk_audio'] = torch.zeros_like(multitalk_audio_input)[-1:]
+                            noise_pred_no_audio, cache_state_audio = transformer(
+                                [z_pos], context=negative_embeds, y=[image_cond_input] if image_cond_input is not None else None,
+                                clip_fea=clip_fea, is_uncond=False, current_step_percentage=current_step_percentage,
+                                pred_id=cache_state[2] if cache_state else None,
+                                vace_data=vace_data,
+                                **base_params
+                            )
+                            noise_pred_no_audio = noise_pred_no_audio[0].to(intermediate_device)
+                            noise_pred = (
+                                noise_pred_no_audio
+                                + cfg_scale * (noise_pred_cond - noise_pred_uncond)
+                                + audio_cfg_scale[idx] * (noise_pred_uncond - noise_pred_no_audio)
+                                )
+                            return noise_pred, [cache_state_cond, cache_state_uncond, cache_state_audio]
+                #batched
+                else:
+                    cache_state_uncond = None
+                    [noise_pred_cond, noise_pred_uncond], cache_state_cond = transformer(
+                        [z] + [z], context=positive_embeds + negative_embeds, 
+                        y=[image_cond_input] + [image_cond_input] if image_cond_input is not None else None,
+                        clip_fea=clip_fea.repeat(2,1,1), is_uncond=False, current_step_percentage=current_step_percentage,
+                        pred_id=cache_state[0] if cache_state else None,
+                        **base_params
+                    )
+            except Exception as e:
+                log.error(f"Error during model prediction: {e}")
+                if force_offload:
+                    if model["manual_offloading"]:
+                        offload_transformer(transformer)
+                raise e
+            #https://github.com/WeichenFan/CFG-Zero-star/
+            if use_cfg_zero_star:
+                alpha = optimized_scale(
+                    noise_pred_cond.view(batch_size, -1),
+                    noise_pred_uncond.view(batch_size, -1)
+                ).view(batch_size, 1, 1, 1)
+            else:
+                alpha = 1.0
+            
+            noise_pred_uncond_scaled = noise_pred_uncond * alpha
+            if use_tangential:
+                noise_pred_uncond_scaled = tangential_projection(noise_pred_cond, noise_pred_uncond_scaled)
+                
+            # RAAG (RATIO-aware Adaptive Guidance)
+            if raag_alpha > 0.0:
+                cfg_scale = get_raag_guidance(noise_pred_cond, noise_pred_uncond_scaled, cfg_scale, raag_alpha)
+                log.info(f"RAAG modified cfg: {cfg_scale}")
+                
+            #https://github.com/WikiChao/FreSca
+            if use_fresca:
+                filtered_cond = fourier_filter(
+                    noise_pred_cond - noise_pred_uncond,
+                    scale_low=fresca_scale_low,
+                    scale_high=fresca_scale_high,
+                    freq_cutoff=fresca_freq_cutoff,
+                )
+                noise_pred = noise_pred_uncond_scaled + cfg_scale * filtered_cond * alpha
+            else:
+                noise_pred = noise_pred_uncond_scaled + cfg_scale * (noise_pred_cond - noise_pred_uncond_scaled)
+            
+            return noise_pred, [cache_state_cond, cache_state_uncond]
+        
     def process(self, model, image_embeds, shift, steps, cfg, seed, scheduler, riflex_freq_index, text_embeds=None,
         force_offload=True, samples=None, feta_args=None, denoise_strength=1.0, context_options=None, 
         cache_args=None, teacache_args=None, flowedit_args=None, batched_cfg=False, slg_args=None, rope_function="default", loop_args=None, 
@@ -2141,322 +2435,9 @@ class WanVideoSampler:
                 fresca_scale_low = experimental_args.get("fresca_scale_low", 1.0)
                 fresca_scale_high = experimental_args.get("fresca_scale_high", 1.25)
                 fresca_freq_cutoff = experimental_args.get("fresca_freq_cutoff", 20)
-
-        #region model pred
-        def predict_with_cfg(z, cfg_scale, positive_embeds, negative_embeds, timestep, idx, image_cond=None, clip_fea=None, 
-                             control_latents=None, vace_data=None, unianim_data=None, audio_proj=None, control_camera_latents=None, 
-                             add_cond=None, cache_state=None, context_window=None, multitalk_audio_embeds=None):
-            nonlocal transformer
-            z = z.to(dtype)
-            with torch.autocast(device_type=mm.get_autocast_device(device), dtype=dtype, enabled=("fp8" in model["quantization"])):
-
-                if use_cfg_zero_star and (idx <= zero_star_steps) and use_zero_init:
-                    return z*0, None
-
-                nonlocal patcher
-                current_step_percentage = idx / len(timesteps)
-                control_lora_enabled = False
-                image_cond_input = None
-                if control_latents is not None:
-                    if control_lora:
-                        control_lora_enabled = True
-                    else:
-                        if (control_start_percent <= current_step_percentage <= control_end_percent) or \
-                            (control_end_percent > 0 and idx == 0 and current_step_percentage >= control_start_percent):
-                            image_cond_input = torch.cat([control_latents.to(z), image_cond.to(z)])
-                        else:
-                            image_cond_input = torch.cat([torch.zeros_like(control_latents, dtype=dtype), image_cond.to(z)])
-                        if fun_ref_image is not None:
-                            fun_ref_input = fun_ref_image.to(z)
-                        else:
-                            fun_ref_input = torch.zeros_like(z, dtype=z.dtype)[:, 0].unsqueeze(1)
-                            #fun_ref_input = None
-
-                    if control_lora:
-                        if not control_start_percent <= current_step_percentage <= control_end_percent:
-                            control_lora_enabled = False
-                            if patcher.model.is_patched:
-                                log.info("Unloading LoRA...")
-                                patcher.unpatch_model(device)
-                                patcher.model.is_patched = False
-                        else:
-                            image_cond_input = control_latents.to(z)
-                            if not patcher.model.is_patched:
-                                log.info("Loading LoRA...")
-                                patcher = apply_lora(patcher, device, device, low_mem_load=False, control_lora=True)
-                                patcher.model.is_patched = True
-                                
-                elif ATI_tracks is not None and ((ati_start_percent <= current_step_percentage <= ati_end_percent) or 
-                              (ati_end_percent > 0 and idx == 0 and current_step_percentage >= ati_start_percent)):
-                    image_cond_input = image_cond_ati.to(z)
-                else:
-                    image_cond_input = image_cond.to(z) if image_cond is not None else None
-
-                if control_camera_latents is not None:
-                    if (control_camera_start_percent <= current_step_percentage <= control_camera_end_percent) or \
-                            (control_end_percent > 0 and idx == 0 and current_step_percentage >= control_camera_start_percent):
-                        control_camera_input = control_camera_latents.to(z)
-                    else:
-                        control_camera_input = None
-
-                if recammaster is not None:
-                    z = torch.cat([z, recam_latents.to(z)], dim=1)
-                    
-                use_phantom = False
-                if phantom_latents is not None:
-                    if (phantom_start_percent <= current_step_percentage <= phantom_end_percent) or \
-                        (phantom_end_percent > 0 and idx == 0 and current_step_percentage >= phantom_start_percent):
-
-                        z_pos = torch.cat([z[:,:-phantom_latents.shape[1]], phantom_latents.to(z)], dim=1)
-                        z_phantom_img = torch.cat([z[:,:-phantom_latents.shape[1]], phantom_latents.to(z)], dim=1)
-                        z_neg = torch.cat([z[:,:-phantom_latents.shape[1]], torch.zeros_like(phantom_latents).to(z)], dim=1)
-                        use_phantom = True
-                        if cache_state is not None and len(cache_state) != 3:
-                            cache_state.append(None)
-                if not use_phantom:
-                    z_pos = z_neg = z
-
-                if controlnet_latents is not None:
-                    if (controlnet_start <= current_step_percentage < controlnet_end):
-                        self.controlnet.to(device)
-                        controlnet_states = self.controlnet(
-                            hidden_states=z.unsqueeze(0).to(device, self.controlnet.dtype),
-                            timestep=timestep,
-                            encoder_hidden_states=positive_embeds[0].unsqueeze(0).to(device, self.controlnet.dtype),
-                            attention_kwargs=None,
-                            controlnet_states=controlnet_latents.to(device, self.controlnet.dtype),
-                            return_dict=False,
-                        )[0]
-                        if isinstance(controlnet_states, (tuple, list)):
-                            controlnet["controlnet_states"] = [x.to(z) for x in controlnet_states]
-                        else:
-                            controlnet["controlnet_states"] = controlnet_states.to(z)
-
-                add_cond_input = None
-                if add_cond is not None:
-                    if (add_cond_start_percent <= current_step_percentage <= add_cond_end_percent) or \
-                        (add_cond_end_percent > 0 and idx == 0 and current_step_percentage >= add_cond_start_percent):
-                        add_cond_input = add_cond
-
-                if minimax_latents is not None:
-                    if context_window is not None:
-                        z_pos = z_neg = torch.cat([z, minimax_latents[:, context_window], minimax_mask_latents[:, context_window]], dim=0)
-                    else:
-                        z_pos = z_neg = torch.cat([z, minimax_latents, minimax_mask_latents], dim=0)
-                
-                if not multitalk_sampling and multitalk_audio_embedding is not None:
-                    audio_embedding = multitalk_audio_embedding
-                    audio_embs = []
-                    indices = (torch.arange(4 + 1) - 2) * 1
-                    human_num = len(audio_embedding)
-                    # split audio with window size
-                    if context_window is None:
-                        for human_idx in range(human_num):   
-                            center_indices = torch.arange(
-                                0,
-                                latent_video_length * 4 + 1 if add_cond is not None else (latent_video_length-1) * 4 + 1,
-                                1).unsqueeze(1) + indices.unsqueeze(0)
-                            center_indices = torch.clamp(center_indices, min=0, max=audio_embedding[human_idx].shape[0] - 1)
-                            audio_emb = audio_embedding[human_idx][center_indices].unsqueeze(0).to(device)
-                            audio_embs.append(audio_emb)
-                    else:
-                        for human_idx in range(human_num):
-                            audio_start = context_window[0] * 4
-                            audio_end = context_window[-1] * 4 + 1
-                            #print("audio_start: ", audio_start, "audio_end: ", audio_end)
-                            center_indices = torch.arange(audio_start, audio_end, 1).unsqueeze(1) + indices.unsqueeze(0)
-                            center_indices = torch.clamp(center_indices, min=0, max=audio_embedding[human_idx].shape[0] - 1)
-                            audio_emb = audio_embedding[human_idx][center_indices].unsqueeze(0).to(device)
-                            audio_embs.append(audio_emb)
-                    multitalk_audio_input = torch.concat(audio_embs, dim=0).to(dtype)
-                    
-                elif multitalk_sampling and multitalk_audio_embeds is not None:
-                    multitalk_audio_input = multitalk_audio_embeds
-                
-                if context_window is not None and pcd_data is not None and pcd_data["render_latent"].shape[2] != context_frames:
-                    pcd_data_input = {"render_latent": pcd_data["render_latent"][:, :, context_window]}
-                    for k in pcd_data:
-                        if k != "render_latent":
-                            pcd_data_input[k] = pcd_data[k]
-                else:
-                    pcd_data_input = pcd_data
-
-                 
-                base_params = {
-                    'seq_len': seq_len,
-                    'device': device,
-                    'freqs': freqs,
-                    't': timestep,
-                    'current_step': idx,
-                    'last_step': len(timesteps) - 1 == idx,
-                    'control_lora_enabled': control_lora_enabled,
-                    'enhance_enabled': enhance_enabled,
-                    'camera_embed': camera_embed,
-                    'unianim_data': unianim_data,
-                    'fun_ref': fun_ref_input if fun_ref_image is not None else None,
-                    'fun_camera': control_camera_input if control_camera_latents is not None else None,
-                    'audio_proj': audio_proj if fantasytalking_embeds is not None else None,
-                    'audio_scale': audio_scale,
-                    "pcd_data": pcd_data_input,
-                    "controlnet": controlnet,
-                    "add_cond": add_cond_input,
-                    "nag_params": text_embeds.get("nag_params", {}),
-                    "nag_context": text_embeds.get("nag_prompt_embeds", None),
-                    "multitalk_audio": multitalk_audio_input if multitalk_audio_embedding is not None else None,
-                    "ref_target_masks": ref_target_masks if multitalk_audio_embedding is not None else None,
-                    "inner_t": [shot_len] if shot_len else None,
-                }
-
-                batch_size = 1
-
-                if not math.isclose(cfg_scale, 1.0):
-                    if negative_embeds is None:
-                        raise ValueError("Negative embeddings must be provided for CFG scale > 1.0")
-                    if len(positive_embeds) > 1:
-                        negative_embeds = negative_embeds * len(positive_embeds)
-
-                try:
-                    if not batched_cfg:
-                        #cond
-                        noise_pred_cond, cache_state_cond = transformer(
-                            [z_pos], context=positive_embeds, y=[image_cond_input] if image_cond_input is not None else None,
-                            clip_fea=clip_fea, is_uncond=False, current_step_percentage=current_step_percentage,
-                            pred_id=cache_state[0] if cache_state else None,
-                            vace_data=vace_data, attn_cond=attn_cond,
-                            **base_params
-                        )
-                        noise_pred_cond = noise_pred_cond[0].to(intermediate_device)
-                        if math.isclose(cfg_scale, 1.0):
-                            if use_fresca:
-                                noise_pred_cond = fourier_filter(
-                                    noise_pred_cond,
-                                    scale_low=fresca_scale_low,
-                                    scale_high=fresca_scale_high,
-                                    freq_cutoff=fresca_freq_cutoff,
-                                )
-                            return noise_pred_cond, [cache_state_cond]
-                        #uncond
-                        if fantasytalking_embeds is not None:
-                            if not math.isclose(audio_cfg_scale[idx], 1.0):
-                                base_params['audio_proj'] = None
-                        noise_pred_uncond, cache_state_uncond = transformer(
-                            [z_neg], context=negative_embeds, clip_fea=clip_fea_neg if clip_fea_neg is not None else clip_fea,
-                            y=[image_cond_input] if image_cond_input is not None else None, 
-                            is_uncond=True, current_step_percentage=current_step_percentage,
-                            pred_id=cache_state[1] if cache_state else None,
-                            vace_data=vace_data, attn_cond=attn_cond_neg,
-                            **base_params
-                        )
-                        noise_pred_uncond = noise_pred_uncond[0].to(intermediate_device)
-                        #phantom
-                        if use_phantom and not math.isclose(phantom_cfg_scale[idx], 1.0):
-                            noise_pred_phantom, cache_state_phantom = transformer(
-                            [z_phantom_img], context=negative_embeds, clip_fea=clip_fea_neg if clip_fea_neg is not None else clip_fea,
-                            y=[image_cond_input] if image_cond_input is not None else None, 
-                            is_uncond=True, current_step_percentage=current_step_percentage,
-                            pred_id=cache_state[2] if cache_state else None,
-                            vace_data=None,
-                            **base_params
-                        )
-                            noise_pred_phantom = noise_pred_phantom[0].to(intermediate_device)
-                            
-                            noise_pred = noise_pred_uncond + phantom_cfg_scale[idx] * (noise_pred_phantom - noise_pred_uncond) + cfg_scale * (noise_pred_cond - noise_pred_phantom)
-                            return noise_pred, [cache_state_cond, cache_state_uncond, cache_state_phantom]
-                        #fantasytalking
-                        if fantasytalking_embeds is not None:
-                            if not math.isclose(audio_cfg_scale[idx], 1.0):
-                                if cache_state is not None and len(cache_state) != 3:
-                                    cache_state.append(None)
-                                base_params['audio_proj'] = None
-                                noise_pred_no_audio, cache_state_audio = transformer(
-                                    [z_pos], context=positive_embeds, y=[image_cond_input] if image_cond_input is not None else None,
-                                    clip_fea=clip_fea, is_uncond=False, current_step_percentage=current_step_percentage,
-                                    pred_id=cache_state[2] if cache_state else None,
-                                    vace_data=vace_data,
-                                    **base_params
-                                )
-                                noise_pred_no_audio = noise_pred_no_audio[0].to(intermediate_device)
-                                noise_pred = (
-                                    noise_pred_uncond
-                                    + cfg_scale * (noise_pred_no_audio - noise_pred_uncond)
-                                    + audio_cfg_scale[idx] * (noise_pred_cond - noise_pred_no_audio)
-                                    )
-                                return noise_pred, [cache_state_cond, cache_state_uncond, cache_state_audio]
-                        elif multitalk_audio_embedding is not None:
-                            if not math.isclose(audio_cfg_scale[idx], 1.0):
-                                if cache_state is not None and len(cache_state) != 3:
-                                    cache_state.append(None)
-                                base_params['multitalk_audio'] = torch.zeros_like(multitalk_audio_input)[-1:]
-                                noise_pred_no_audio, cache_state_audio = transformer(
-                                    [z_pos], context=negative_embeds, y=[image_cond_input] if image_cond_input is not None else None,
-                                    clip_fea=clip_fea, is_uncond=False, current_step_percentage=current_step_percentage,
-                                    pred_id=cache_state[2] if cache_state else None,
-                                    vace_data=vace_data,
-                                    **base_params
-                                )
-                                noise_pred_no_audio = noise_pred_no_audio[0].to(intermediate_device)
-                                noise_pred = (
-                                    noise_pred_no_audio
-                                    + cfg_scale * (noise_pred_cond - noise_pred_uncond)
-                                    + audio_cfg_scale[idx] * (noise_pred_uncond - noise_pred_no_audio)
-                                    )
-                                return noise_pred, [cache_state_cond, cache_state_uncond, cache_state_audio]
-
-                    #batched
-                    else:
-                        cache_state_uncond = None
-                        [noise_pred_cond, noise_pred_uncond], cache_state_cond = transformer(
-                            [z] + [z], context=positive_embeds + negative_embeds, 
-                            y=[image_cond_input] + [image_cond_input] if image_cond_input is not None else None,
-                            clip_fea=clip_fea.repeat(2,1,1), is_uncond=False, current_step_percentage=current_step_percentage,
-                            pred_id=cache_state[0] if cache_state else None,
-                            **base_params
-                        )
-                except Exception as e:
-                    log.error(f"Error during model prediction: {e}")
-                    if force_offload:
-                        if model["manual_offloading"]:
-                            offload_transformer(transformer)
-                    raise e
-
-                #https://github.com/WeichenFan/CFG-Zero-star/
-                if use_cfg_zero_star:
-                    alpha = optimized_scale(
-                        noise_pred_cond.view(batch_size, -1),
-                        noise_pred_uncond.view(batch_size, -1)
-                    ).view(batch_size, 1, 1, 1)
-                else:
-                    alpha = 1.0
-                
-                noise_pred_uncond_scaled = noise_pred_uncond * alpha
-
-                if use_tangential:
-                    noise_pred_uncond_scaled = tangential_projection(noise_pred_cond, noise_pred_uncond_scaled)
-
-                # RAAG (RATIO-aware Adaptive Guidance)
-                if raag_alpha > 0.0:
-                    cfg_scale = get_raag_guidance(noise_pred_cond, noise_pred_uncond_scaled, cfg_scale, raag_alpha)
-                    log.info(f"RAAG modified cfg: {cfg_scale}")
-
-                #https://github.com/WikiChao/FreSca
-                if use_fresca:
-                    filtered_cond = fourier_filter(
-                        noise_pred_cond - noise_pred_uncond,
-                        scale_low=fresca_scale_low,
-                        scale_high=fresca_scale_high,
-                        freq_cutoff=fresca_freq_cutoff,
-                    )
-                    noise_pred = noise_pred_uncond_scaled + cfg_scale * filtered_cond * alpha
-                else:
-                    noise_pred = noise_pred_uncond_scaled + cfg_scale * (noise_pred_cond - noise_pred_uncond_scaled)
-                
-
-                return noise_pred, [cache_state_cond, cache_state_uncond]
-            
+  
         log.info(f"Seq len: {seq_len}")
            
-        
-
         if args.preview_method in [LatentPreviewMethod.Auto, LatentPreviewMethod.Latent2RGB]: #default for latent2rgb
             from latent_preview import prepare_callback
         else:
