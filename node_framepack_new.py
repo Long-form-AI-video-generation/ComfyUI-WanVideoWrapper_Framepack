@@ -3197,6 +3197,42 @@ class WanVideoSampler:
             "samples": callback_latent.unsqueeze(0).cpu() if callback is not None else None, 
         })
 
+# Framepack VACE specific Sampler
+class WanVideoFramepackSampler:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model": ("WANVIDEOMODEL",), # Expects the loaded FramepackVace model
+                "steps": ("INT", {"default": 30, "min": 1}),
+                "cfg": ("FLOAT", {"default": 6.0, "min": 0.0, "max": 30.0, "step": 0.01}),
+                "shift": ("FLOAT", {"default": 5.0, "min": 0.0, "max": 1000.0, "step": 0.01}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
+                "scheduler": (scheduler_list, {"default": "uni_pc",}),
+                "text_embeds": ("WANVIDEOTEXTEMBEDS", ), 
+                "frame_num": ("INT", {"default": 81, "min": 1}), # Total number of frames for the output video
+                "context_scale": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.1}),
+                "image_width": ("INT", {"default": 832, "min": 16}), 
+                "image_height": ("INT", {"default": 480, "min": 16}), 
+                "src_video": ("VIDEO", {"default": None}), 
+                "src_mask": ("MASK", {"default": None}), 
+                "src_ref_images": ("IMAGE", {"default": None}), 
+                "force_offload": ("BOOLEAN", {"default": True, "tooltip": "Moves the model to the offload device after sampling"}),
+            },
+            "optional": {
+                "denoise_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "freeinit_args": ("FREEINITARGS", ),
+                "start_step": ("INT", {"default": 0, "min": 0, "max": 10000, "step": 1, "tooltip": "Start step for the sampling, 0 means full sampling, otherwise samples only from this step"}),
+                "end_step": ("INT", {"default": -1, "min": -1, "max": 10000, "step": 1, "tooltip": "End step for the sampling, -1 means full sampling, otherwise samples only until this step"}),
+            }
+        }
+        
+    RETURN_TYPES = ("LATENT",)
+    RETURN_NAMES = ("samples",)
+    FUNCTION = "process"
+    CATEGORY = "WanVideoWrapper"
+    DESCRIPTION = "A sampler specifically for the FramePack algorithm for long video generation."
+
 #region VideoDecode
 class WanVideoDecode:
     @classmethod
