@@ -3233,6 +3233,23 @@ class WanVideoFramepackSampler:
     CATEGORY = "WanVideoWrapper"
     DESCRIPTION = "A sampler specifically for the FramePack algorithm for long video generation."
 
+    def process(self, model, steps, cfg, shift, seed, scheduler, text_embeds, frame_num, context_scale, 
+                image_width, image_height, src_video=None, src_mask=None, src_ref_images=None, force_offload=True, 
+                denoise_strength=1.0, freeinit_args=None, start_step=0, end_step=-1):
+        # Ensure the provided model is an instance of FramepackVace
+        if not isinstance(model.model, FramepackVace):
+            raise TypeError("This sampler requires a FramepackVace model. Please check your model loader node.")
+            
+        # Get the FramepackVace instance and the current device
+        framepack_vace = model.model
+        current_device = mm.get_torch_device()
+        
+        # Extract positive and negative prompts from the text_embeds dictionary
+        prompt = text_embeds["prompt_embeds"][0] if text_embeds["prompt_embeds"] else ""
+        n_prompt = text_embeds["negative_prompt_embeds"][0][0] if text_embeds["negative_prompt_embeds"] else ""
+        
+        
+        
 #region VideoDecode
 class WanVideoDecode:
     @classmethod
