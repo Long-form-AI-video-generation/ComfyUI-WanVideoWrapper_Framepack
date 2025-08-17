@@ -3248,7 +3248,47 @@ class WanVideoFramepackSampler:
         prompt = text_embeds["prompt_embeds"][0] if text_embeds["prompt_embeds"] else ""
         n_prompt = text_embeds["negative_prompt_embeds"][0][0] if text_embeds["negative_prompt_embeds"] else ""
         
+        # ComfyUI's VIDEO format is (B, F, H, W, C). The model expects (B, C, F, H, W).        
+        # Handle src_video: (B, F, H, W, C) -> (B, C, F, H, W)
+        input_frames_list = [src_video.permute(0, 4, 1, 2, 3)] if src_video is not None else [None]
         
+        # Handle src_mask: (B, H, W) -> (B, 1, F, H, W) 
+        input_masks_list = [src_mask.unsqueeze(0).unsqueeze(0).permute(0, 1, 4, 2, 3)] if src_mask is not None else [None]
+        
+        # Handle src_ref_images: (B, H, W, C) -> (B, C, 1, H, W) 
+        input_ref_images_list = [src_ref_images.permute(0, 3, 1, 2).unsqueeze(1)] if src_ref_images is not None else [None]
+
+        # Calling the FramepackVace instance.
+        src_video_prepared, src_mask_prepared, src_ref_images_prepared = framepack_vace.prepare_source(
+            input_frames_list,
+            input_masks_list,
+            input_ref_images_list,
+            frame_num,
+            (image_height, image_width), 
+            current_device
+        )
+        
+        # Calling FramePack generation method.
+        log.info(f"Starting FramePack generation for {frame_num} frames.")
+        final_video_latent = framepack_vace.generate_with_framepack(
+            input_prompt=prompt,
+            input_frames=src_video_prepared,
+            input_masks=src_mask_prepared,
+            input_ref_images=src_ref_images_prepared,
+            size=(image_width, image_height), 
+            frame_num=frame_num,
+            sample_solver=scheduler,
+            sampling_steps=steps,
+            guide_scale=cfg,
+            n_prompt=n_prompt,
+            seed=seed,
+            offload_model=force_offload
+        )
+
+        log.info(f"FramePack generation complete. Output latent tensor shape: {final_video_latent.shape}")
+
+        # The output of generate_with_framepack is a single tensor (C, T, H, W).
+        return ({"samples": final_video_latent.unsqueeze(0).cpu(),},)
         
 #region VideoDecode
 class WanVideoDecode:
