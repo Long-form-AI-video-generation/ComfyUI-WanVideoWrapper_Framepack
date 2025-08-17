@@ -3198,7 +3198,7 @@ class WanVideoSampler:
         })
 
 # Framepack VACE specific Sampler
-class WanVideoFramepackSampler:
+class WanVACEVideoFramepackSampler:
     @classmethod
     def INPUT_TYPES(s):
         return {
@@ -3531,6 +3531,7 @@ NODE_CLASS_MAPPINGS = {
     "WanVideoTextEncodeCached": WanVideoTextEncodeCached,
     "WanVideoAddExtraLatent": WanVideoAddExtraLatent,
     "WanVideoLatentReScale": WanVideoLatentReScale,
+    "WanVACEVideoFramepackSampler": WanVACEVideoFramepackSampler,
     }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoSampler": "WanVideo Sampler",
@@ -3562,4 +3563,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoTextEncodeCached": "WanVideo TextEncode Cached",
     "WanVideoAddExtraLatent": "WanVideo Add Extra Latent",
     "WanVideoLatentReScale": "WanVideo Latent ReScale",
+    "WanVACEVideoFramepackSampler": "WanVideo Framepack Sampler",
     }
