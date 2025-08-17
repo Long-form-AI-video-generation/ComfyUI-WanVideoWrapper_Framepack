@@ -7,7 +7,9 @@ import inspect
 import hashlib
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 
-from .wanvideo.modules.model import rope_params
+# Importing the Vace related classes
+from .wanvideo.modules.model import rope_params,VaceWanModel, VaceWanAttentionBlock, BaseWanAttentionBlock
+
 from .custom_linear import remove_lora_from_module, set_lora_params
 from .wanvideo.schedulers import get_scheduler, get_sampling_sigmas, retrieve_timesteps, scheduler_list
 from .gguf.gguf import set_lora_params_gguf
@@ -26,6 +28,10 @@ from comfy.utils import ProgressBar, common_upscale
 from comfy.clip_vision import clip_preprocess, ClipVisionModel
 from comfy.cli_args import args, LatentPreviewMethod
 import folder_paths
+
+# Import the necessary FramePack classes
+from .wanvideo.framepack_vace import FramepackVace
+from .wanvideo.wan_video_vae import WanVideoVAE 
 
 script_directory = os.path.dirname(os.path.abspath(__file__))
 
