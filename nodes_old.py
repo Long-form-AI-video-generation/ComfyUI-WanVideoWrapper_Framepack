@@ -7,9 +7,7 @@ import inspect
 import hashlib
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 
-# Importing the Vace related classes
-from .wanvideo.modules.model import rope_params,VaceWanModel, VaceWanAttentionBlock, BaseWanAttentionBlock
-
+from .wanvideo.modules.model import rope_params
 from .custom_linear import remove_lora_from_module, set_lora_params
 from .wanvideo.schedulers import get_scheduler, get_sampling_sigmas, retrieve_timesteps, scheduler_list
 from .gguf.gguf import set_lora_params_gguf
@@ -28,10 +26,6 @@ from comfy.utils import ProgressBar, common_upscale
 from comfy.clip_vision import clip_preprocess, ClipVisionModel
 from comfy.cli_args import args, LatentPreviewMethod
 import folder_paths
-
-# Import the necessary FramePack classes
-from .wanvideo.framepack_vace import FramepackVace
-from .wanvideo.wan_video_vae import WanVideoVAE 
 
 script_directory = os.path.dirname(os.path.abspath(__file__))
 
@@ -3197,99 +3191,6 @@ class WanVideoSampler:
             "samples": callback_latent.unsqueeze(0).cpu() if callback is not None else None, 
         })
 
-# Framepack VACE specific Sampler
-class WanVACEVideoFramepackSampler:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "model": ("WANVIDEOMODEL",), # Expects the loaded FramepackVace model
-                "steps": ("INT", {"default": 30, "min": 1}),
-                "cfg": ("FLOAT", {"default": 6.0, "min": 0.0, "max": 30.0, "step": 0.01}),
-                "shift": ("FLOAT", {"default": 5.0, "min": 0.0, "max": 1000.0, "step": 0.01}),
-                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
-                "scheduler": (scheduler_list, {"default": "uni_pc",}),
-                "text_embeds": ("WANVIDEOTEXTEMBEDS", ), 
-                "frame_num": ("INT", {"default": 81, "min": 1}), # Total number of frames for the output video
-                "context_scale": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.1}),
-                "image_width": ("INT", {"default": 832, "min": 16}), 
-                "image_height": ("INT", {"default": 480, "min": 16}), 
-                "src_video": ("VIDEO", {"default": None}), 
-                "src_mask": ("MASK", {"default": None}), 
-                "src_ref_images": ("IMAGE", {"default": None}), 
-                "force_offload": ("BOOLEAN", {"default": True, "tooltip": "Moves the model to the offload device after sampling"}),
-            },
-            "optional": {
-                "denoise_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "freeinit_args": ("FREEINITARGS", ),
-                "start_step": ("INT", {"default": 0, "min": 0, "max": 10000, "step": 1, "tooltip": "Start step for the sampling, 0 means full sampling, otherwise samples only from this step"}),
-                "end_step": ("INT", {"default": -1, "min": -1, "max": 10000, "step": 1, "tooltip": "End step for the sampling, -1 means full sampling, otherwise samples only until this step"}),
-            }
-        }
-        
-    RETURN_TYPES = ("LATENT",)
-    RETURN_NAMES = ("samples",)
-    FUNCTION = "process"
-    CATEGORY = "WanVideoWrapper"
-    DESCRIPTION = "A sampler specifically for the FramePack algorithm for long video generation."
-
-    def process(self, model, steps, cfg, shift, seed, scheduler, text_embeds, frame_num, context_scale, 
-                image_width, image_height, src_video=None, src_mask=None, src_ref_images=None, force_offload=True, 
-                denoise_strength=1.0, freeinit_args=None, start_step=0, end_step=-1):
-        # Ensure the provided model is an instance of FramepackVace
-        if not isinstance(model.model, FramepackVace):
-            raise TypeError("This sampler requires a FramepackVace model. Please check your model loader node.")
-            
-        # Get the FramepackVace instance and the current device
-        framepack_vace = model.model
-        current_device = mm.get_torch_device()
-        
-        # Extract positive and negative prompts from the text_embeds dictionary
-        prompt = text_embeds["prompt_embeds"][0] if text_embeds["prompt_embeds"] else ""
-        n_prompt = text_embeds["negative_prompt_embeds"][0][0] if text_embeds["negative_prompt_embeds"] else ""
-        
-        # ComfyUI's VIDEO format is (B, F, H, W, C). The model expects (B, C, F, H, W).        
-        # Handle src_video: (B, F, H, W, C) -> (B, C, F, H, W)
-        input_frames_list = [src_video.permute(0, 4, 1, 2, 3)] if src_video is not None else [None]
-        
-        # Handle src_mask: (B, H, W) -> (B, 1, F, H, W) 
-        input_masks_list = [src_mask.unsqueeze(0).unsqueeze(0).permute(0, 1, 4, 2, 3)] if src_mask is not None else [None]
-        
-        # Handle src_ref_images: (B, H, W, C) -> (B, C, 1, H, W) 
-        input_ref_images_list = [src_ref_images.permute(0, 3, 1, 2).unsqueeze(1)] if src_ref_images is not None else [None]
-
-        # Calling the FramepackVace instance.
-        src_video_prepared, src_mask_prepared, src_ref_images_prepared = framepack_vace.prepare_source(
-            input_frames_list,
-            input_masks_list,
-            input_ref_images_list,
-            frame_num,
-            (image_height, image_width), 
-            current_device
-        )
-        
-        # Calling FramePack generation method.
-        log.info(f"Starting FramePack generation for {frame_num} frames.")
-        final_video_latent = framepack_vace.generate_with_framepack(
-            input_prompt=prompt,
-            input_frames=src_video_prepared,
-            input_masks=src_mask_prepared,
-            input_ref_images=src_ref_images_prepared,
-            size=(image_width, image_height), 
-            frame_num=frame_num,
-            sample_solver=scheduler,
-            sampling_steps=steps,
-            guide_scale=cfg,
-            n_prompt=n_prompt,
-            seed=seed,
-            offload_model=force_offload
-        )
-
-        log.info(f"FramePack generation complete. Output latent tensor shape: {final_video_latent.shape}")
-
-        # The output of generate_with_framepack is a single tensor (C, T, H, W).
-        return ({"samples": final_video_latent.unsqueeze(0).cpu(),},)
-        
 #region VideoDecode
 class WanVideoDecode:
     @classmethod
@@ -3531,7 +3432,6 @@ NODE_CLASS_MAPPINGS = {
     "WanVideoTextEncodeCached": WanVideoTextEncodeCached,
     "WanVideoAddExtraLatent": WanVideoAddExtraLatent,
     "WanVideoLatentReScale": WanVideoLatentReScale,
-    "WanVACEVideoFramepackSampler": WanVACEVideoFramepackSampler,
     }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoSampler": "WanVideo Sampler",
@@ -3563,5 +3463,4 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoTextEncodeCached": "WanVideo TextEncode Cached",
     "WanVideoAddExtraLatent": "WanVideo Add Extra Latent",
     "WanVideoLatentReScale": "WanVideo Latent ReScale",
-    "WanVACEVideoFramepackSampler": "WanVideo Framepack Sampler",
     }
